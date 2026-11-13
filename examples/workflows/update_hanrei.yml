@@ -1,0 +1,333 @@
+# 判例（hanrei_v1）の週次更新（docs/tsutatsu_hanrei_weekly.md の段 1。コードは scripts/hanrei/weekly/run.cjs）
+#
+#   毎週日曜 07:00 JST に prepare（裁判所の一覧 直近 2 年 → 新しい判例だけ詳細・PDF → パース → 原審の引き当て → 埋め込み）を回し、
+#   「安全チェックに通り、見直す対象も無い」ときだけ apply（退避してから R2 の hanrei_v1 を上書き・Vectorize の _hanrei に upsert・既知の id を更新）まで自動で流す。
+#   それ以外は書く前に止めて Issue（ラベル hanrei-update）でオーナーに知らせる:
+#     - 安全チェックで止めた: 原因を直してから再実行する
+#     - 見直す対象がある（初回・一覧の件数が減った など）: 問題なければ Issue に「反映」とコメントすると流れる
+#   新しい判例が無い週は何もしない（Issue も立てない）。
+#
+#   手動実行（Actions → Update hanrei data → Run workflow）:
+#     mode=prepare  週次と同じ（自動で反映まで）
+#     mode=restore  restore_run_id の反映を戻す（退避は R2 update_state/hanrei_backup/<run_id>/。後に別の反映が入っていれば書かずに止まる）
+#   反映の道は「問題の無い回の自動反映」と「Issue への『反映』コメント」の 2 つだけ（手動の apply は無い）。
+#   apply・restore はこのワークフローからしか動かない（run.cjs が手元での実行を拒む）。両ジョブは concurrency（update-hanrei-write）で 1 本ずつ流れるので同時に書かない
+#   必要な secrets: CLOUDFLARE_ACCOUNT_ID、CF_DATA_API_TOKEN（R2 編集・Vectorize 編集・Workers AI 読み取り。法令の週次と同じ）
+name: Update hanrei data
+
+on:
+  schedule:
+    - cron: '0 22 * * 6'   # 日曜 07:00 JST（法令の週次 05:00 の後）
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'prepare / restore'
+        type: choice
+        options: [prepare, restore]
+        default: prepare
+      restore_run_id:
+        description: 'mode=restore のとき戻す反映の run_id（反映の Issue に書いてある。例 12345678901-1）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+# 1 本ずつ流すのは書き込むジョブ（apply・restore）だけ。ワークフロー全体に掛けると、関係ない Issue コメントでも
+# 待機枠に入り、待っている反映・戻しを押し出しうる（GitHub の concurrency は待機を 1 つしか持たない）
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DATA_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+  HANREI_STATE_DIR: ${{ github.workspace }}/hanrei_state
+  UPDATE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  GH_TOKEN: ${{ github.token }}
+  AI_POOLING: ${{ vars.AI_POOLING || '' }}   # wrangler.toml の AI_POOLING と同じ値（法令の週次と共通の Variables）
+  R2_TRANSPORT: ${{ vars.R2_TRANSPORT || 'auto' }}
+
+jobs:
+  # ---------------------------------------------------------------- 準備（R2・Vectorize に書かない）
+  prepare:
+    if: ${{ github.event_name != 'issue_comment' && (github.event.inputs.mode || 'prepare') == 'prepare' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      ok: ${{ steps.manifest.outputs.ok }}
+      review: ${{ steps.manifest.outputs.review }}
+      nothing: ${{ steps.manifest.outputs.nothing }}
+      added: ${{ steps.manifest.outputs.added }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 反映は main のコードでしか流さない
+      - name: package.json だけ LFS から取る（node が LFS のポインタを読めないため。他の LFS は取らない）
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 依存（pdfplumber）
+        run: pip install pdfplumber
+      - name: R2 の通り道の確認（書かない）
+        run: node scripts/update/lib/r2.cjs --selftest
+      - name: prepare
+        run: node scripts/hanrei/weekly/run.cjs prepare
+      - name: manifest を出力に
+        id: manifest
+        run: |
+          M="$HANREI_STATE_DIR/manifest.json"
+          echo "ok=$(node -e "console.log(require('$M').ok_to_apply)")" >> "$GITHUB_OUTPUT"
+          echo "review=$(node -e "console.log(!!require('$M').needs_review)")" >> "$GITHUB_OUTPUT"
+          echo "nothing=$(node -e "console.log(!!require('$M').nothing_to_do)")" >> "$GITHUB_OUTPUT"
+          echo "added=$(node -e "console.log(require('$M').added_ids.length)")" >> "$GITHUB_OUTPUT"
+          cat "$HANREI_STATE_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: prepare が落ちたときは Issue を立てる（黙って止まらない）
+        if: ${{ failure() }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          gh label create hanrei-update --color 1D76DB --description "判例データ更新の確認" --force >/dev/null 2>&1 || true
+          printf '@%s\n\n**判例データ更新の準備（prepare）が途中で落ちました。R2・Vectorize には何も書いていません。** ログ: %s\n\nこの Issue の URL を Claude に渡してください。\n' "$OWNER" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /tmp/issue_body.md
+          gh issue create --title "判例データ更新 $DATE: 準備に失敗" --body-file /tmp/issue_body.md --label hanrei-update --assignee "$OWNER"
+      - name: artifact を小さくする（取得した HTML・PDF は apply で使わない）
+        run: rm -rf "$HANREI_STATE_DIR/work"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hanrei-state
+          path: ${{ env.HANREI_STATE_DIR }}
+          retention-days: 10
+          if-no-files-found: error
+      - name: 書く前に止めたときは Issue を立てる（安全チェックで止めた／見直す対象がある）
+        if: ${{ steps.manifest.outputs.nothing != 'true' && (steps.manifest.outputs.ok != 'true' || steps.manifest.outputs.review == 'true') }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          OK: ${{ steps.manifest.outputs.ok }}
+        run: |
+          N=${{ steps.manifest.outputs.added }}
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          gh label create hanrei-update --color 1D76DB --description "判例データ更新の確認" --force >/dev/null 2>&1 || true
+          {
+            echo "@$OWNER"
+            echo ""
+            if [ "$OK" = "true" ]; then
+              echo "**見直す対象があるので、書く前に止めています（R2・Vectorize には何も書いていません）。** 下の「見直す対象」を見てください。"
+              echo ""
+              echo "- 問題なければ、この Issue に「反映」とコメント（通知メールに「反映」と返信でも可）→ そのまま反映が走ります"
+              echo "- 直すなら、この Issue の URL を Claude に渡して直してもらい、Actions の Update hanrei data を再実行してください"
+            else
+              echo "**安全チェックで止めています（R2・Vectorize には何も書いていません）。** 下の「止めた理由」を見て原因を直し、Actions の Update hanrei data を再実行してください（この Issue の URL を Claude に渡せば直せます）。"
+            fi
+            echo ""
+            echo "prepare_run_id: ${{ github.run_id }}"
+            echo "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            head -c 60000 "$HANREI_STATE_DIR/report.md"
+          } > /tmp/issue_body.md
+          if [ "$OK" = "true" ]; then TITLE="判例データ更新 $DATE: $N 件【未反映・要確認】"; else TITLE="判例データ更新 $DATE: $N 件【止めた・要修正】"; fi
+          gh issue create --title "$TITLE" --body-file /tmp/issue_body.md --label hanrei-update --assignee "$OWNER"
+
+  # ---------------------------------------------------------------- 「反映」コメントの確かめ（書き込みの concurrency に入らない）
+  # 判定を書き込みジョブの中でやると、「反映は保留」のような何もしないコメントでも write の待機枠に入り、待っている restore を押し出す
+  # （GitHub の concurrency は待機を 1 つしか持たない）。ここで確かめ、ちょうど「反映」のときだけ apply を作る（update_tsutatsu.yml と同じ）
+  approve:
+    if: >-
+      ${{ github.event_name == 'issue_comment'
+          && github.event.issue.state == 'open'
+          && contains(github.event.issue.labels.*.name, 'hanrei-update')
+          && contains(github.event.issue.title, '未反映・要確認')
+          && github.event.comment.user.login == github.repository_owner
+          && contains(github.event.comment.body, '反映') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+      run_id: ${{ steps.gate.outputs.run_id }}
+      issue: ${{ github.event.issue.number }}
+    steps:
+      - name: 最初の行がちょうど「反映」か確かめ、反映する prepare を決める（「反映しないで」「反映は保留」では動かない）
+        id: gate
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          # 通知メールへの返信で付く引用（> …）と空行を除いた最初の行を、前後の空白・句点を落として比べる
+          FIRST=$(printf '%s\n' "$COMMENT_BODY" | tr -d '\r' | grep -v '^[[:space:]]*>' | sed -e 's/^[[:space:]　]*//' -e 's/[[:space:]　。．.!！]*$//' | grep -v '^$' | head -1)
+          if [ "$FIRST" != "反映" ]; then echo "go=false" >> "$GITHUB_OUTPUT"; echo "最初の行が「反映」ではないので何もしない"; exit 0; fi
+          RUN_ID=$(printf '%s' "$ISSUE_BODY" | grep -oE 'prepare_run_id: *[0-9]+' | grep -oE '[0-9]+' | head -1)
+          test -n "$RUN_ID" || { echo "Issue に prepare_run_id が無い"; exit 1; }
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- 反映（通って要確認も無ければそのまま。要確認の回は「反映」コメントで）
+  apply:
+    needs: [prepare, approve]
+    concurrency:
+      group: update-hanrei-write
+      cancel-in-progress: false
+    if: >-
+      ${{ !cancelled() && (
+          (github.event_name != 'issue_comment' && needs.prepare.result == 'success' && needs.prepare.outputs.ok == 'true' && needs.prepare.outputs.review != 'true' && needs.prepare.outputs.nothing != 'true')
+          || (github.event_name == 'issue_comment' && needs.approve.result == 'success' && needs.approve.outputs.go == 'true')) }}
+    outputs:
+      health_code: ${{ steps.health.outputs.code }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: 反映する prepare を決める
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then RUN_ID="${{ needs.approve.outputs.run_id }}"; else RUN_ID="${{ github.run_id }}"; fi
+          test -n "$RUN_ID" || { echo "反映する prepare が見つかりません"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "issue=${{ needs.approve.outputs.issue }}" >> "$GITHUB_OUTPUT"
+      - name: prepare の成果物を取る
+        run: gh run download "${{ steps.pick.outputs.run_id }}" -n hanrei-state -D "$HANREI_STATE_DIR"
+      - name: apply
+        id: apply
+        env:
+          # 見直す対象がある回（初回を含む）は、オーナーの「反映」コメント（approve ジョブを通ったもの）から来たときだけ書ける
+          HANREI_APPROVED: ${{ github.event_name == 'issue_comment' && '1' || '0' }}
+        run: node scripts/hanrei/weekly/run.cjs apply
+      - name: 結果を知らせる（失敗したときだけ Issue。要確認の Issue から流したときはそこに書いて閉じる）
+        if: ${{ always() }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          ISSUE: ${{ steps.pick.outputs.issue }}
+          OUTCOME: ${{ steps.apply.outcome }}
+        run: |
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          LOG="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RID=$(node -e "console.log(require(process.env.HANREI_STATE_DIR+'/manifest.json').run_id)" 2>/dev/null || echo "?")
+          gh label create hanrei-update --color 1D76DB --description "判例データ更新の確認" --force >/dev/null 2>&1 || true
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -n "$ISSUE" ]; then
+              printf '反映しました（run_id: %s）。戻すときは Actions の Update hanrei data を mode=restore・restore_run_id=%s で実行（main のコードで動く。後に別の反映が入っていれば書かずに止まる）。\n\nログ: %s\n' "$RID" "$RID" "$LOG" > /tmp/c.md
+              gh issue comment "$ISSUE" --body-file /tmp/c.md && gh issue close "$ISSUE"
+            fi
+          else
+            {
+              echo "@$OWNER"
+              echo ""
+              echo "**判例データの反映に失敗しました。** ログ: $LOG"
+              echo ""
+              echo "途中まで書いた分は、Actions の Update hanrei data を mode=restore・restore_run_id=$RID で実行すると戻せます（main のコードで動く）。この Issue の URL を Claude に渡してください。"
+            } > /tmp/issue_body.md
+            if [ -n "$ISSUE" ]; then gh issue comment "$ISSUE" --body-file /tmp/issue_body.md; else gh issue create --title "判例データ更新 $DATE: 反映に失敗" --body-file /tmp/issue_body.md --label hanrei-update --assignee "$OWNER"; fi
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: hanrei-state-applied-${{ github.run_id }}
+          path: |
+            ${{ env.HANREI_STATE_DIR }}/manifest.json
+            ${{ env.HANREI_STATE_DIR }}/report.md
+          retention-days: 90
+      - name: 本番チェック（判例の週次の反映後・足した判例のページも見る。docs/health_check.md）
+        id: health
+        if: ${{ steps.apply.outcome == 'success' }}
+        run: |
+          mkdir -p /tmp/health
+          set +e
+          node scripts/health/check_prod.cjs --hanrei-manifest "$HANREI_STATE_DIR/manifest.json" --out /tmp/health/health.md --json /tmp/health/health.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4   # 知らせは health_notify.yml（全呼び出し元で 1 本ずつ）
+        if: ${{ always() && steps.health.outcome == 'success' }}
+        with:
+          name: health-report
+          path: /tmp/health/
+          overwrite: true
+          retention-days: 30
+
+  # 本番チェックの結果を知らせる（Issue ラベル health-check。docs/health_check.md）
+  health-notify:
+    needs: [apply]
+    if: ${{ always() && needs.apply.outputs.health_code != '' }}
+    uses: ./.github/workflows/health_notify.yml
+    with:
+      code: ${{ needs.apply.outputs.health_code }}
+      context: 判例の週次の反映後
+    permissions:
+      contents: read
+      issues: write
+
+  # ---------------------------------------------------------------- 戻す（手動）
+  restore:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'restore' }}
+    concurrency:
+      group: update-hanrei-write
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 入力の確認
+        env:
+          RID: ${{ github.event.inputs.restore_run_id }}
+        run: 'echo "$RID" | grep -qE "^[0-9A-Za-z_-]+$" || { echo "restore_run_id を指定してください（例 12345678901-1）"; exit 1; }'
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: restore
+        env:
+          RID: ${{ github.event.inputs.restore_run_id }}
+        run: node scripts/hanrei/weekly/run.cjs restore "$RID"
+
+  # ---------------------------------------------------------------- 条番号の無い判例の判断した条（docs/lineage.md「判例の週次・改正にこの判定を当てる仕組み」）
+  # prepare が待ち行列（R2 update_state/lineage_nonum_queue.json）に入れた、引用を 1 つも読めず「法令名＋第○条」の形も無い新しい判例に、
+  # 本番の /api/select → Jev（0.7 以上）→ 決まらなければ Opus 5.5 で判断した条を付け、lineage_v1/policy/nonum_final.json と hanrei_v2 に足す（退避つき）。
+  # 1 週の上限（vars NONUM_WEEK_JPY・既定 ¥1,500）で止め、溢れた分は次の週。新しい判例の無い週も、残っている待ち行列を流す
+  nonum:
+    needs: [prepare, apply]
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.prepare.result == 'success' && (needs.apply.result == 'success' || needs.apply.result == 'skipped') }}
+    concurrency:
+      group: update-hanrei-write
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: ¥0 の確認
+        run: |
+          node scripts/lineage/check_judge.cjs
+          node scripts/lineage/check_no_v1_links.cjs
+      - name: 待ち行列の判例に判断した条を付ける
+        id: run
+        env:
+          JUDGE_URL: ${{ vars.JEV_WORKER_URL || 'https://{あなたの Worker}.workers.dev' }}
+          JUDGE_KEY: ${{ secrets.QA_BYPASS_KEY }}
+          NONUM_WEEK_JPY: ${{ vars.NONUM_WEEK_JPY || '1500' }}
+        run: node scripts/lineage/nonum_cases.cjs run
+      - name: 失敗したら Issue
+        if: ${{ failure() }}
+        run: |
+          gh label create hanrei-update --color 1D76DB --description "判例データ更新の確認" --force >/dev/null 2>&1 || true
+          gh issue create --label hanrei-update --title "条番号の無い判例の判断した条が止まった（run ${{ github.run_id }}）" \
+            --body "Actions の Update hanrei data の nonum ジョブが止まりました: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          待ち行列（R2 update_state/lineage_nonum_queue.json）は残っているので、次の週にもう一度流れます。書いた途中のものは update_state/hanrei_v2_backup/nonum-*/ に退避しています。docs/lineage.md「判例の週次・改正にこの判定を当てる仕組み」"

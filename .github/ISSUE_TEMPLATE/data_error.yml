@@ -1,0 +1,29 @@
+name: データの誤り
+description: 条文・参照関係・委任先などの誤りを知らせる
+labels: [data-error]
+body:
+  - type: input
+    id: target
+    attributes:
+      label: ID
+      description: 誤りのある記録の ID（article_id・from・gap_id など）
+      placeholder: 417AC0000000086_Art26
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: どこが違うか・正しい内容
+    validations:
+      required: true
+  - type: input
+    id: evidence
+    attributes:
+      label: 根拠（官報・原典の URL）
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: 版（MANIFEST.json の release）
+      placeholder: 2026-11-02

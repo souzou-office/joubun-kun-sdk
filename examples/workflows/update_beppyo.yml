@@ -1,0 +1,326 @@
+# 別表のベクトル（tsutatsu-embeddings-v1 の _beppyo・bpr_*）の週次更新（docs/tsutatsu_hanrei_weekly.md の「別表」。コードは scripts/beppyo/weekly/）
+#
+#   毎週日曜 15:13 JST（法令の週次 05:00 の後）に、今の本番の条文（ARTICLES_PREFIX の別表のファイル）と refs（REFS_PREFIX）から
+#   _beppyo（1 別表 1 本）と大別表の行（bpr_*）の「あるべき全体」を作り、前回反映した状態の控え（R2 update_state/beppyo/）と比べる
+#   （build。反映の下見。書かない）。作り方は PC の 13・13b・15 と同じ関数（scripts/rebuild/lib/beppyo.cjs）。
+#   下見が「安全チェックに通り、見直す対象も無い」ときだけ、そのまま反映する（apply。退避してから Vectorize を書く。R2 のファイルは書かない）。
+#   それ以外は書く前に止めて Issue（ラベル beppyo-update）でオーナーに知らせる:
+#     - 下見で止める条件に掛かった／落ちた: 原因を直してから再実行する
+#     - 見直す対象がある（初回・埋め込みや削除が多い など）: 問題なければ Issue に「反映」とコメントすると流れる
+#   下見の後に法令の週次が反映されたら（台帳・refs_index.json が変わったら）古い下見は反映しない。LLM は使わない（埋め込みは Workers AI）。
+#
+#   手動実行（Actions → Update beppyo vectors → Run workflow）:
+#     mode=build    週次と同じ（下見 → 問題が無ければ反映まで）
+#     mode=restore  restore_run_id の反映を戻す（退避は R2 update_state/beppyo_backup/<run_id>/。後に別の反映が入っていれば書かずに止まる）
+#   反映の道は「問題の無い回の自動反映」と「Issue への『反映』コメント」の 2 つだけ（手動の apply は無い）。
+#   apply・restore はこのワークフローからしか動かない（apply.cjs が手元での実行を拒む）。両ジョブは concurrency（update-beppyo-write）で 1 本ずつ流れる
+#
+#   必要な secrets: CLOUDFLARE_ACCOUNT_ID、CF_DATA_API_TOKEN（R2 の読み書き・Vectorize の読み書き・Workers AI。法令・判例・通達の週次と同じもの）
+name: Update beppyo vectors
+
+on:
+  schedule:
+    - cron: '13 6 * * 0'   # 日曜 15:13 JST（法令の週次 05:00 の反映の後。下見の後に法令が反映されれば反映の段で止まる）
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'build / restore'
+        type: choice
+        options: [build, restore]
+        default: build
+      restore_run_id:
+        description: 'mode=restore のとき戻す反映の run_id（反映の結果に書いてある。例 12345678901-1）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+# 1 本ずつ流すのはジョブごと（下見は update-beppyo-build、書き込む apply・restore は update-beppyo-write）。
+# ワークフロー全体に掛けると、関係ない Issue コメントでも待機枠に入り、待っている反映・戻しを押し出しうる（GitHub の concurrency は待機を 1 つしか持たない）
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DATA_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+  UPDATE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  BEPPYO_WEEKLY_OUT: ${{ github.workspace }}/beppyo_weekly
+  R2_TRANSPORT: ${{ vars.R2_TRANSPORT || 'auto' }}
+  GH_TOKEN: ${{ github.token }}
+  AI_POOLING: ${{ vars.AI_POOLING || '' }}   # wrangler.toml の AI_POOLING と同じ値（法令・判例・通達の週次と共通の Variables）
+
+jobs:
+  # ---------------------------------------------------------------- 反映の下見。本番のデータには書かない
+  build:
+    if: ${{ github.event_name != 'issue_comment' && (github.event.inputs.mode || 'build') == 'build' }}
+    concurrency:
+      group: update-beppyo-build
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    outputs:
+      ok: ${{ steps.manifest.outputs.ok }}
+      review: ${{ steps.manifest.outputs.review }}
+      nothing: ${{ steps.manifest.outputs.nothing }}
+      attempt: ${{ github.run_attempt }}   # 成果物の名前に入れた試行の番号（「失敗したジョブだけ再実行」でも下見を流した試行の番号が残る）
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: 反映の下見（今の本番の条文・refs から作り直して前回と比べる。書かない）
+        id: build
+        run: |
+          set +e
+          node scripts/beppyo/weekly/run.cjs build
+          CODE=$?
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          if [ -f "$BEPPYO_WEEKLY_OUT/build/report.md" ]; then cat "$BEPPYO_WEEKLY_OUT/build/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          # 0 = 通った / 3 = 止めた（下で Issue）/ それ以外 = 落ちた
+          if [ "$CODE" != "0" ] && [ "$CODE" != "3" ]; then exit "$CODE"; fi
+      - name: 下見の結果を出力に
+        id: manifest
+        if: ${{ steps.build.outputs.code == '0' }}
+        run: |
+          M="$BEPPYO_WEEKLY_OUT/build/manifest.json"
+          if [ ! -f "$M" ]; then echo "nothing=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "ok=$(node -e "console.log(!!require('$M').ok_to_apply)")" >> "$GITHUB_OUTPUT"
+          echo "review=$(node -e "console.log(!!require('$M').needs_review)")" >> "$GITHUB_OUTPUT"
+          echo "nothing=$(node -e "console.log(!!require('$M').nothing_to_do)")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: beppyo-build-${{ github.run_id }}-${{ github.run_attempt }}   # 再実行（同じ run_id）でも名前がぶつからないように試行の番号を入れる
+          path: |
+            ${{ env.BEPPYO_WEEKLY_OUT }}/build/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: 止めた・落ちたときは Issue を立てる
+        if: ${{ always() && (steps.build.outputs.code != '0' || failure()) }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          BCODE: ${{ steps.build.outputs.code }}
+        run: |
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          LOG="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh label create beppyo-update --color 0E8A16 --description "別表のベクトルの更新の確認" --force >/dev/null 2>&1 || true
+          {
+            echo "@$OWNER"
+            echo ""
+            if [ "$BCODE" = "3" ]; then
+              echo "**別表のベクトルの反映の下見で、止める条件に掛かりました（本番のデータには何も書いていません。まだ反映の段は動いていません）。** 下の「止めた理由」を見てください。"
+            else
+              echo "**別表のベクトルの反映の下見が途中で落ちました（本番のデータには何も書いていません）。** ログを見てください。"
+            fi
+            echo ""
+            echo "- この Issue の URL を Claude に渡せば、原因の調べと直しを頼めます"
+            echo "- 何もしなければ翌週また下見します"
+            echo ""
+            echo "ログ: $LOG"
+            echo ""
+            if [ -f "$BEPPYO_WEEKLY_OUT/build/report.md" ]; then head -c 30000 "$BEPPYO_WEEKLY_OUT/build/report.md"; else echo "（報告が作れる前に落ちました。ログを見てください）"; fi
+          } > /tmp/issue_body.md
+          if [ "$BCODE" = "3" ]; then TITLE="別表のベクトルの反映の下見 $DATE: 【止めた・要確認】"; else TITLE="別表のベクトルの反映の下見 $DATE: 失敗"; fi
+          gh issue create --title "$TITLE" --body-file /tmp/issue_body.md --label beppyo-update --assignee "$OWNER"
+      - name: 見直す対象がある回は、書く前に止めて Issue を立てる（「反映」コメントで流れる）
+        if: ${{ steps.manifest.outputs.ok == 'true' && steps.manifest.outputs.review == 'true' && steps.manifest.outputs.nothing != 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          LOG="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh label create beppyo-update --color 0E8A16 --description "別表のベクトルの更新の確認" --force >/dev/null 2>&1 || true
+          {
+            echo "@$OWNER"
+            echo ""
+            echo "**別表のベクトルの反映の下見に、見直す対象があるので書く前に止めています（本番のデータには何も書いていません）。** 下の「見直す対象」を見てください。"
+            echo ""
+            echo "- 問題なければ、この Issue に「反映」とコメント（通知メールに「反映」と返信でも可）→ そのまま反映が走ります（退避してから書きます。戻すこともできます）"
+            echo "- 直すなら、この Issue の URL を Claude に渡して直してもらい、Actions の Update beppyo vectors を再実行してください"
+            echo "- 何もしなければ翌週また下見します（そのときはこの Issue を閉じて新しい Issue にします）"
+            echo ""
+            echo "build_run_id: ${{ github.run_id }}"
+            echo "build_attempt: ${{ github.run_attempt }}"
+            echo "実行ログ: $LOG"
+            echo ""
+            head -c 60000 "$BEPPYO_WEEKLY_OUT/build/report.md"
+          } > /tmp/issue_body.md
+          PREV=$(gh issue list --label beppyo-update --state open --search '未反映・要確認 in:title' --json number -q '.[].number')
+          NEW=$(gh issue create --title "別表のベクトルの反映 $DATE【未反映・要確認】" --body-file /tmp/issue_body.md --label beppyo-update --assignee "$OWNER")
+          # 前の週の要確認は、この回の下見に含まれる（下見は毎回、今の本番と比べる）。古い下見は反映の段でも止まるので閉じておく
+          for n in $PREV; do
+            gh issue comment "$n" --body "新しい下見が出たので、この回は反映しません（今の本番と比べ直した新しい回に、この回の変化も入っています）: $NEW" && gh issue close "$n" || true
+          done
+
+  # ---------------------------------------------------------------- 「反映」コメントの確かめ（書き込みの concurrency に入らない）
+  # 判定を書き込みジョブの中でやると、「反映は保留」のような何もしないコメントでも write の待機枠に入り、待っている restore を押し出す
+  # （GitHub の concurrency は待機を 1 つしか持たない）。ここで確かめ、ちょうど「反映」のときだけ apply を作る
+  approve:
+    if: >-
+      ${{ github.event_name == 'issue_comment'
+          && github.event.issue.state == 'open'
+          && contains(github.event.issue.labels.*.name, 'beppyo-update')
+          && contains(github.event.issue.title, '未反映・要確認')
+          && github.event.comment.user.login == github.repository_owner
+          && contains(github.event.comment.body, '反映') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+      run_id: ${{ steps.gate.outputs.run_id }}
+      attempt: ${{ steps.gate.outputs.attempt }}
+      issue: ${{ github.event.issue.number }}
+    steps:
+      - name: 最初の行がちょうど「反映」か確かめ、反映する下見を決める（「反映しないで」「反映は保留」では動かない）
+        id: gate
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          # 通知メールへの返信で付く引用（> …）と空行を除いた最初の行を、前後の空白・句点を落として比べる
+          FIRST=$(printf '%s\n' "$COMMENT_BODY" | tr -d '\r' | grep -v '^[[:space:]]*>' | sed -e 's/^[[:space:]　]*//' -e 's/[[:space:]　。．.!！]*$//' | grep -v '^$' | head -1)
+          if [ "$FIRST" != "反映" ]; then echo "go=false" >> "$GITHUB_OUTPUT"; echo "最初の行が「反映」ではないので何もしない"; exit 0; fi
+          RUN_ID=$(printf '%s' "$ISSUE_BODY" | grep -oE 'build_run_id: *[0-9]+' | grep -oE '[0-9]+' | head -1)
+          test -n "$RUN_ID" || { echo "Issue に build_run_id が無い"; exit 1; }
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          ATTEMPT=$(printf '%s' "$ISSUE_BODY" | grep -oE 'build_attempt: *[0-9]+' | grep -oE '[0-9]+' | head -1)
+          echo "attempt=$ATTEMPT" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- 反映（通って要確認も無ければそのまま。要確認の回は「反映」コメントで）
+  apply:
+    needs: [build, approve]
+    concurrency:
+      group: update-beppyo-write
+      cancel-in-progress: false
+    if: >-
+      ${{ !cancelled() && (
+          (github.event_name != 'issue_comment' && needs.build.result == 'success' && needs.build.outputs.ok == 'true' && needs.build.outputs.review != 'true' && needs.build.outputs.nothing != 'true')
+          || (github.event_name == 'issue_comment' && needs.approve.result == 'success' && needs.approve.outputs.go == 'true')) }}
+    outputs:
+      health_code: ${{ steps.health.outputs.code }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 反映は main のコードでしか流さない
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: 反映する下見を決める
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then RUN_ID="${{ needs.approve.outputs.run_id }}"; else RUN_ID="${{ github.run_id }}"; fi
+          test -n "$RUN_ID" || { echo "反映する下見が見つかりません"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "issue=${{ needs.approve.outputs.issue }}" >> "$GITHUB_OUTPUT"
+          echo "attempt=${{ needs.approve.outputs.attempt }}" >> "$GITHUB_OUTPUT"
+      - name: 下見の成果物を取る（同じ実行から続けて流すとき）
+        if: ${{ github.event_name != 'issue_comment' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: beppyo-build-${{ github.run_id }}-${{ needs.build.outputs.attempt }}
+          path: ${{ env.BEPPYO_WEEKLY_OUT }}/build   # 上げたのは build/ の中身だけ（1 フォルダを上げると中身が成果物の直下になる）
+      - name: 下見の成果物を取る（「反映」コメントで来たとき）
+        if: ${{ github.event_name == 'issue_comment' }}
+        env:
+          ATTEMPT: ${{ steps.pick.outputs.attempt }}
+        run: |
+          # 試行の番号が Issue に無い（この直しより前に立てた Issue）ときは、番号の無い名前で取る
+          NAME="beppyo-build-${{ steps.pick.outputs.run_id }}${ATTEMPT:+-$ATTEMPT}"
+          gh run download "${{ steps.pick.outputs.run_id }}" -n "$NAME" -D "$BEPPYO_WEEKLY_OUT/build"
+      - name: apply
+        id: apply
+        env:
+          # 見直す対象がある回（初回を含む）は、オーナーの「反映」コメント（approve ジョブを通ったもの）から来たときだけ書ける
+          BEPPYO_APPROVED: ${{ github.event_name == 'issue_comment' && '1' || '0' }}
+        run: node scripts/beppyo/weekly/run.cjs apply
+      - name: 結果を知らせる（失敗したときだけ Issue。要確認の Issue から流したときはそこに書いて閉じる）
+        if: ${{ always() }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          ISSUE: ${{ steps.pick.outputs.issue }}
+          OUTCOME: ${{ steps.apply.outcome }}
+        run: |
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          LOG="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RID=$(node -e "console.log(require(process.env.BEPPYO_WEEKLY_OUT+'/build/manifest.json').run_id)" 2>/dev/null || echo "?")
+          gh label create beppyo-update --color 0E8A16 --description "別表のベクトルの更新の確認" --force >/dev/null 2>&1 || true
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -n "$ISSUE" ]; then
+              printf '反映しました（run_id: %s）。戻すときは Actions の Update beppyo vectors を mode=restore・restore_run_id=%s で実行（main のコードで動く。後に別の反映が入っていれば書かずに止まる）。\n\nログ: %s\n' "$RID" "$RID" "$LOG" > /tmp/c.md
+              gh issue comment "$ISSUE" --body-file /tmp/c.md && gh issue close "$ISSUE"
+            fi
+          else
+            {
+              echo "@$OWNER"
+              echo ""
+              echo "**別表のベクトルの反映に失敗しました。** ログ: $LOG"
+              echo ""
+              echo "書き始める前に止まったときは本番は変わっていません（ログに「書かずに止める」「何も書いていない」と出ます）。途中まで書いた分は、Actions の Update beppyo vectors を mode=restore・restore_run_id=$RID で実行すると戻せます（main のコードで動く）。この Issue の URL を Claude に渡してください。"
+            } > /tmp/issue_body.md
+            if [ -n "$ISSUE" ]; then gh issue comment "$ISSUE" --body-file /tmp/issue_body.md; else gh issue create --title "別表のベクトルの反映 $DATE: 失敗" --body-file /tmp/issue_body.md --label beppyo-update --assignee "$OWNER"; fi
+          fi
+      - name: 本番チェック（別表のベクトルの週次の反映後。docs/health_check.md）
+        id: health
+        if: ${{ steps.apply.outcome == 'success' }}
+        run: |
+          mkdir -p /tmp/health
+          set +e
+          node scripts/health/check_prod.cjs --out /tmp/health/health.md --json /tmp/health/health.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4   # 知らせは health_notify.yml（全呼び出し元で 1 本ずつ）
+        if: ${{ always() && steps.health.outcome == 'success' }}
+        with:
+          name: health-report
+          path: /tmp/health/
+          overwrite: true
+          retention-days: 30
+
+  # 本番チェックの結果を知らせる（Issue ラベル health-check。docs/health_check.md）
+  health-notify:
+    needs: [apply]
+    if: ${{ always() && needs.apply.outputs.health_code != '' }}
+    uses: ./.github/workflows/health_notify.yml
+    with:
+      code: ${{ needs.apply.outputs.health_code }}
+      context: 別表のベクトルの週次の反映後
+    permissions:
+      contents: read
+      issues: write
+
+  # ---------------------------------------------------------------- 戻す（手動）
+  restore:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'restore' }}
+    concurrency:
+      group: update-beppyo-write
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 入力の確認
+        env:
+          RID: ${{ github.event.inputs.restore_run_id }}
+        run: 'echo "$RID" | grep -qE "^[0-9A-Za-z_-]+$" || { echo "restore_run_id を指定してください（例 12345678901-1）"; exit 1; }'
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: restore
+        env:
+          RID: ${{ github.event.inputs.restore_run_id }}
+        run: node scripts/beppyo/weekly/run.cjs restore "$RID"

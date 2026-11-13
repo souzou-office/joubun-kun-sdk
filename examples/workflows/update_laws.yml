@@ -1,0 +1,494 @@
+# 法令データの週次更新（docs/law_update.md）
+#
+#   毎週日曜 05:00 JST に prepare（e-Gov の差分 → パース → R2 との比較 → 埋め込み → refs 抽出）を回し、
+#   「安全チェックに通り、見直す対象も無い」ときだけ apply（R2・Vectorize・refs・台帳への反映）まで自動で流す。
+#   それ以外は**書く前に止めて**知らせる（Issue ラベル law-update を立ててオーナーに割り当てる = メールが届く）:
+#     - 安全チェックで止めた（パース失敗など）: 原因を直してから再実行する。そのまま流す経路は作らない
+#     - 見直す対象がある（条番号の振り直し疑い・宙に浮く紐付け・見出しの変化・廃止法令）: 未反映のまま Issue。
+#       確認して問題なければ Issue に「反映」とコメント（通知メールへの返信でも可）すると流れる。直すなら直してから再実行
+#     - 反映に失敗した
+#
+#   手動実行（Actions → Update law data → Run workflow）:
+#     mode=diff   週次と同じ（自動で反映まで）
+#     mode=check  全件を e-Gov と比べて報告だけ（包括チェック。R2 に書かない。埋め込みと refs 抽出は飛ばす）
+#     mode=embedcheck  埋め込みのずれ検査だけ（Workers AI の出力が索引と一致するか。既定 / cls / mean の 3 通り。何も書かない）
+#     mode=laws   laws に列挙した法令だけ（テスト用。自動で反映まで）
+#     mode=apply  prepare_run_id の準備結果を反映する（原因を直した後に prepare だけやり直した場合など。blockers 付きなら force が要る）
+#     mode=refs   refs（参照関係）だけ全件作り直す（抽出ロジックを変えたとき。条文・ベクトル・台帳は触らない。Branch は main）
+#     mode=full   全件再構築。articles_prefix（例 large_law_articles_v4）と refs_prefix（例 refs_chunks_v5）を新しく指定し、
+#                 old_articles_prefix（今の本番 v3）と比べてベクトルは変わった項だけ作る。本番のプレフィックスには書かないので
+#                 1 job で prepare→apply を続けて流す（Run workflow を押すことが承認）
+#
+#   必要な secrets: CLOUDFLARE_ACCOUNT_ID、CF_DATA_API_TOKEN（R2 編集・Vectorize 編集・Workers AI 読み取り）
+name: Update law data
+
+on:
+  schedule:
+    - cron: '0 20 * * 6'   # 日曜 05:00 JST
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'diff / check / laws / apply / full / apply-full / refs / embedcheck'
+        type: choice
+        options: [diff, check, laws, apply, full, apply-full, refs, embedcheck]
+        default: diff
+      laws:
+        description: 'mode=laws のときの法令 ID（カンマ区切り）'
+        type: string
+        default: ''
+      prepare_run_id:
+        description: 'mode=apply / apply-full のとき反映する prepare の実行 ID（apply は空なら最新の「止めた」Issue から。apply-full は必須）'
+        type: string
+        default: ''
+      articles_prefix:
+        description: 'mode=full のときの新プレフィックス（例 large_law_articles_v4）'
+        type: string
+        default: ''
+      old_articles_prefix:
+        description: 'mode=full のときの比較元（例 large_law_articles_v3）'
+        type: string
+        default: 'large_law_articles_v3'
+      refs_prefix:
+        description: 'mode=full のときの refs プレフィックス（例 refs_chunks_v5）'
+        type: string
+        default: ''
+      old_refs_prefix:
+        description: 'mode=full のとき、抽出に失敗した法令の refs を写してくる元（例 refs_chunks_v4）'
+        type: string
+        default: 'refs_chunks_v4'
+      apply_skip:
+        description: 'mode=apply-full のとき飛ばす段（例 07,08。すでに書き終えた段を繰り返さない）'
+        type: string
+        default: ''
+      force:
+        description: 'blockers があっても apply する（理由を理解しているときだけ）'
+        type: boolean
+        default: false
+      law:
+        description: 'mode=embedcheck のときに見る法令 ID（空なら司法書士法。長い項が多い法令は 332AC0000000026 租税特別措置法）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DATA_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+  UPDATE_STATE_DIR: ${{ github.workspace }}/update_state
+  UPDATE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  NODE_PATH: ${{ github.workspace }}/.tools/node_modules
+  GH_TOKEN: ${{ github.token }}
+  MODE: ${{ github.event_name == 'issue_comment' && 'apply' || github.event.inputs.mode || 'diff' }}
+  AI_POOLING: ${{ vars.AI_POOLING || '' }}   # リポジトリの Variables で設定（wrangler.toml の AI_POOLING と同じ値にする）
+  DELEGATIONS_PREFIX: ${{ vars.DELEGATIONS_PREFIX || 'delegations_v6' }}   # 委任先（05_diff が読む）。wrangler.toml の DELEGATIONS_PREFIX と同じ値にする
+  TSUTATSU_CHUNKS_PREFIX: ${{ vars.TSUTATSU_CHUNKS_PREFIX || 'tsutatsu_chunks_v4' }}   # 通達（05_diff の宙に浮く紐付けが読む）。wrangler.toml の TSUTATSU_CHUNKS_PREFIX と同じ値にする
+  R2_TRANSPORT: ${{ vars.R2_TRANSPORT || 'auto' }}   # R2 の通り道。auto=S3 API（鍵は API トークンから導く）、だめなら REST。full は s3 を強制
+
+jobs:
+  # ---------------------------------------------------------------- 準備（R2 に書かない）
+  prepare:
+    if: ${{ github.event_name != 'issue_comment' && (github.event.inputs.mode || 'diff') != 'full' && (github.event.inputs.mode || 'diff') != 'apply' && (github.event.inputs.mode || 'diff') != 'apply-full' && (github.event.inputs.mode || 'diff') != 'refs' && (github.event.inputs.mode || 'diff') != 'embedcheck' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      ok: ${{ steps.manifest.outputs.ok }}
+      laws: ${{ steps.manifest.outputs.laws }}
+      review: ${{ steps.manifest.outputs.review }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 依存（lxml・lawtext）
+        run: |
+          pip install lxml
+          mkdir -p .tools && cd .tools && printf '{"name":"tools","private":true}\n' > package.json && npm install --no-audit --no-fund lawtext@0.2.1
+      - name: R2 の通り道の確認（書かない）
+        run: node scripts/update/lib/r2.cjs --selftest
+      - name: prepare
+        run: |
+          case "$MODE" in
+            check) node scripts/update/run.cjs check --all ;;
+            laws)  node scripts/update/run.cjs prepare --laws "${{ github.event.inputs.laws }}" ;;
+            *)     node scripts/update/run.cjs prepare ;;
+          esac
+      - name: manifest を出力に
+        id: manifest
+        run: |
+          echo "ok=$(node -e "console.log(require(process.env.UPDATE_STATE_DIR+'/manifest.json').ok_to_apply)")" >> "$GITHUB_OUTPUT"
+          echo "laws=$(node -e "console.log(Object.keys(require(process.env.UPDATE_STATE_DIR+'/manifest.json').laws).length)")" >> "$GITHUB_OUTPUT"
+          echo "review=$(node -e "console.log(!!require(process.env.UPDATE_STATE_DIR+'/manifest.json').needs_review)")" >> "$GITHUB_OUTPUT"
+      - name: artifact を小さくする（XML・退避用の写し・埋め込み入力は apply で使わない）
+        run: rm -rf "$UPDATE_STATE_DIR/xml" "$UPDATE_STATE_DIR/old" "$UPDATE_STATE_DIR/embed_inputs.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-state
+          path: ${{ env.UPDATE_STATE_DIR }}
+          retention-days: 10
+          if-no-files-found: error
+      - name: 書く前に止めたときは Issue を立てる（安全チェックで止めた／見直す対象がある）
+        if: ${{ env.MODE != 'check' && steps.manifest.outputs.laws != '0' && (steps.manifest.outputs.ok != 'true' || steps.manifest.outputs.review == 'true') }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          OK: ${{ steps.manifest.outputs.ok }}
+        run: |
+          N=${{ steps.manifest.outputs.laws }}
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          gh label create law-update --color 0E8A16 --description "法令データ更新の確認" --force >/dev/null 2>&1 || true
+          {
+            echo "@$OWNER"
+            echo ""
+            if [ "$OK" = "true" ]; then
+              echo "**見直す対象があるので、書く前に止めています（R2 には何も書いていません）。** 下の「見直す対象」の表を見てください。"
+              echo ""
+              echo "- 問題なければ、この Issue に「反映」とコメント（通知メールに「反映」と返信でも可）→ そのまま反映が走ります"
+              echo "- 直すなら、この Issue の URL を Claude に渡して直してもらい、Actions の Update law data を再実行してください"
+              echo "- 何もしなければ翌週また同じ内容で止まります"
+            else
+              echo "**安全チェックで止めています（R2 には何も書いていません）。** 下の「止めた理由」を見て原因を直し、Actions の Update law data を再実行してください（直すのは Claude に頼めます。この Issue の URL を渡せば足ります）。直さなければ翌週また同じ理由で止まります。"
+            fi
+            echo ""
+            echo "prepare_run_id: ${{ github.run_id }}"
+            echo "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            head -c 60000 "$UPDATE_STATE_DIR/report.md"
+          } > /tmp/issue_body.md
+          if [ "$OK" = "true" ]; then TITLE="法令データ更新 $DATE: $N 法令【未反映・要確認】"; else TITLE="法令データ更新 $DATE: $N 法令【止めた・要修正】"; fi
+          gh issue create --title "$TITLE" --body-file /tmp/issue_body.md --label law-update --assignee "$OWNER"
+
+  # ---------------------------------------------------------------- 反映（通って要確認も無ければそのまま。要確認の回は「反映」コメントで。mode=apply は手動用）
+  apply:
+    needs: [prepare]
+    if: >-
+      ${{ !cancelled() && (
+          (needs.prepare.result == 'success' && needs.prepare.outputs.ok == 'true' && needs.prepare.outputs.review != 'true' && needs.prepare.outputs.laws != '0' && (github.event.inputs.mode || 'diff') != 'check')
+          || (github.event_name == 'issue_comment'
+              && github.event.issue.state == 'open'
+              && contains(github.event.issue.labels.*.name, 'law-update')
+              && contains(github.event.issue.title, '未反映・要確認')
+              && github.event.comment.user.login == github.repository_owner
+              && contains(github.event.comment.body, '反映'))
+          || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'apply')) }}
+    outputs:
+      health_code: ${{ steps.health.outputs.code }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: 「反映」コメントか確かめる（最初の行がちょうど「反映」のときだけ。「反映しないで」「反映は来週」では動かない。update_hanrei.yml と同じ）
+        id: gate
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if [ "${{ github.event_name }}" != "issue_comment" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # 通知メールへの返信で付く引用（> …）と空行を除いた最初の行を、前後の空白・句点を落として比べる
+          FIRST=$(printf '%s\n' "$COMMENT_BODY" | tr -d '\r' | grep -v '^[[:space:]]*>' | sed -e 's/^[[:space:]　]*//' -e 's/[[:space:]　。．.!！]*$//' | grep -v '^$' | head -1)
+          if [ "$FIRST" = "反映" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; echo "最初の行が「反映」ではないので何もしない"; fi
+      - name: 反映する prepare を決める
+        if: ${{ steps.gate.outputs.go == 'true' }}
+        id: pick
+        env:
+          INPUT_RUN_ID: ${{ github.event.inputs.prepare_run_id }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          RUN_ID="$INPUT_RUN_ID"
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          # 同じ実行の prepare から続けて流すとき
+          if [ -z "$RUN_ID" ] && [ "${{ needs.prepare.result }}" = "success" ]; then RUN_ID="${{ github.run_id }}"; fi
+          # 「反映」コメントで来たときは、その Issue に書いてある prepare
+          if [ -z "$RUN_ID" ] && [ -n "$ISSUE_BODY" ]; then RUN_ID=$(printf '%s' "$ISSUE_BODY" | grep -oE 'prepare_run_id: *[0-9]+' | grep -oE '[0-9]+' | head -1); fi
+          if [ -z "$RUN_ID" ]; then
+            # 手動 mode=apply で指定が無ければ、最新の開いている Issue に書いてある prepare を使う
+            ISSUE_NUM=$(gh issue list --label law-update --state open --limit 1 --json number --jq '.[0].number')
+            [ -n "$ISSUE_NUM" ] && RUN_ID=$(gh issue view "$ISSUE_NUM" --json body --jq .body | grep -oE 'prepare_run_id: *[0-9]+' | grep -oE '[0-9]+' | head -1)
+          fi
+          test -n "$RUN_ID" || { echo "反映する prepare が見つかりません（prepare_run_id を指定してください）"; exit 1; }
+          FORCE=false
+          [ "${{ github.event.inputs.force }}" = "true" ] && FORCE=true
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "issue=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          echo "force=$FORCE" >> "$GITHUB_OUTPUT"
+          echo "prepare run: $RUN_ID / issue: $ISSUE_NUM / force: $FORCE"
+      - name: prepare の成果物を取る
+        if: ${{ steps.gate.outputs.go == 'true' }}
+        run: gh run download "${{ steps.pick.outputs.run_id }}" -n update-state -D "$UPDATE_STATE_DIR"
+      - name: apply
+        if: ${{ steps.gate.outputs.go == 'true' }}
+        id: apply
+        run: node scripts/update/run.cjs apply ${{ steps.pick.outputs.force == 'true' && '--force' || '' }}
+      - name: 結果を知らせる（失敗したときだけ Issue。要確認の Issue から流したときはそこに書いて閉じる）
+        if: ${{ always() && steps.gate.outputs.go == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          ISSUE: ${{ steps.pick.outputs.issue }}
+          OUTCOME: ${{ steps.apply.outcome }}
+        run: |
+          DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          LOG="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh label create law-update --color 0E8A16 --description "法令データ更新の確認" --force >/dev/null 2>&1 || true
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -n "$ISSUE" ]; then
+              printf '反映しました（run_id: %s）。戻すときは `node scripts/update/restore_backup.cjs %s`。\n\nログ: %s\n' "$UPDATE_RUN_ID" "$UPDATE_RUN_ID" "$LOG" > /tmp/c.md
+              gh issue comment "$ISSUE" --body-file /tmp/c.md && gh issue close "$ISSUE"
+            fi
+          else
+            {
+              echo "@$OWNER"
+              echo ""
+              echo "**反映に失敗しました。** ログ: $LOG"
+              echo ""
+              echo "途中まで書いた分は \`node scripts/update/restore_backup.cjs $UPDATE_RUN_ID\` で戻せます。この Issue の URL を Claude に渡してください。"
+            } > /tmp/issue_body.md
+            if [ -n "$ISSUE" ]; then gh issue comment "$ISSUE" --body-file /tmp/issue_body.md; else gh issue create --title "法令データ更新 $DATE: 反映に失敗" --body-file /tmp/issue_body.md --label law-update --assignee "$OWNER"; fi
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.gate.outputs.go == 'true' }}
+        with:
+          name: update-state-applied-${{ github.run_id }}
+          path: |
+            ${{ env.UPDATE_STATE_DIR }}/*.json
+            ${{ env.UPDATE_STATE_DIR }}/report.md
+          retention-days: 90
+      - name: 本番チェック（法令の週次の反映後・今回変わった条文のページも見る。docs/health_check.md）
+        id: health
+        if: ${{ steps.apply.outcome == 'success' }}
+        run: |
+          mkdir -p /tmp/health
+          set +e
+          node scripts/health/check_prod.cjs --laws-manifest "$UPDATE_STATE_DIR/manifest.json" --out /tmp/health/health.md --json /tmp/health/health.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4   # 知らせは health_notify.yml（全呼び出し元で 1 本ずつ）
+        if: ${{ always() && steps.health.outcome == 'success' }}
+        with:
+          name: health-report
+          path: /tmp/health/
+          overwrite: true
+          retention-days: 30
+
+  # ---------------------------------------------------------------- 全件再構築（新プレフィックスへ。Run workflow が承認）
+  # prepare（3〜4 時間）と apply（1〜2 時間）は 1 ジョブの上限 6 時間に収まらないので別ジョブ。間は R2（update_state/runs/{run_id}/state.tar.gz）で渡す
+  full:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      ARTICLES_PREFIX: ${{ github.event.inputs.articles_prefix }}
+      OLD_ARTICLES_PREFIX: ${{ github.event.inputs.old_articles_prefix }}
+      REFS_PREFIX: ${{ github.event.inputs.refs_prefix }}
+      OLD_REFS_PREFIX: ${{ github.event.inputs.old_refs_prefix }}
+      R2_TRANSPORT: s3   # 数十万オブジェクトの読み書き。REST API は 5 分 1,200 件で 429 になる
+      UPDATE_CONCURRENCY: '48'
+    outputs:
+      stash_rid: ${{ steps.stash.outputs.rid }}   # 退避した ID（full-apply を「失敗したジョブを再実行」しても同じ退避を使う）
+    steps:
+      - name: 入力の確認
+        run: |
+          test -n "$ARTICLES_PREFIX" || { echo "articles_prefix を指定してください（例 large_law_articles_v4）"; exit 1; }
+          test -n "$REFS_PREFIX" || { echo "refs_prefix を指定してください（例 refs_chunks_v5）"; exit 1; }
+          test "$ARTICLES_PREFIX" != "$OLD_ARTICLES_PREFIX" || { echo "新プレフィックスは比較元と別にしてください"; exit 1; }
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 反映は main のコードでしか流さない
+          lfs: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 依存（lxml・lawtext）
+        run: |
+          pip install lxml
+          mkdir -p .tools && cd .tools && printf '{"name":"tools","private":true}\n' > package.json && npm install --no-audit --no-fund lawtext@0.2.1
+      - name: R2 の通り道の確認（S3 API・書かない）
+        run: node scripts/update/lib/r2.cjs --selftest
+      - name: prepare（全件）
+        run: node scripts/update/run.cjs prepare --all
+      - name: XML を消して容量を空ける
+        run: rm -rf "$UPDATE_STATE_DIR/xml"
+      - name: 成果物を R2 に退避（apply ジョブに渡す）
+        id: stash
+        run: |
+          node scripts/update/stash_state.cjs push "$UPDATE_RUN_ID"
+          echo "rid=$UPDATE_RUN_ID" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-rebuild-state
+          path: |
+            ${{ env.UPDATE_STATE_DIR }}/*.json
+            ${{ env.UPDATE_STATE_DIR }}/report.md
+          retention-days: 90
+
+  full-apply:
+    needs: [full]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (needs.full.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'apply-full')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      ARTICLES_PREFIX: ${{ github.event.inputs.articles_prefix }}
+      OLD_ARTICLES_PREFIX: ${{ github.event.inputs.old_articles_prefix }}
+      REFS_PREFIX: ${{ github.event.inputs.refs_prefix }}
+      OLD_REFS_PREFIX: ${{ github.event.inputs.old_refs_prefix }}   # 09 patch が「全件再構築」と判定して reverse_refs を作り直す条件（REFS_PREFIX と違うこと）
+      R2_TRANSPORT: s3
+      UPDATE_CONCURRENCY: '48'
+      NODE_OPTIONS: --max-old-space-size=8192   # 09 が refs チャンク（数百 MB）を全部メモリに載せる
+    steps:
+      - name: 入力の確認
+        env:
+          INPUT_RUN_ID: ${{ github.event.inputs.prepare_run_id }}
+        run: |
+          test -n "$ARTICLES_PREFIX" || { echo "articles_prefix を指定してください（例 large_law_articles_v4）"; exit 1; }
+          test -n "$REFS_PREFIX" || { echo "refs_prefix を指定してください（例 refs_chunks_v5）"; exit 1; }
+          test "$ARTICLES_PREFIX" != "$OLD_ARTICLES_PREFIX" || { echo "新プレフィックスは比較元と別にしてください"; exit 1; }
+          if [ "$MODE" = "apply-full" ]; then test -n "$INPUT_RUN_ID" || { echo "apply-full には prepare_run_id（prepare の実行 ID）が要ります"; exit 1; }; fi
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 反映は main のコードでしか流さない
+          lfs: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: prepare の成果物を R2 から取る
+        env:
+          INPUT_RUN_ID: ${{ github.event.inputs.prepare_run_id }}
+          STASH_RID: ${{ needs.full.outputs.stash_rid }}
+        run: |
+          # mode=full は今回の prepare が退避した ID（output。ジョブを再実行しても変わらない）。apply-full のときだけ prepare_run_id を使う
+          if [ "$MODE" = "apply-full" ]; then RID="$INPUT_RUN_ID"; else RID="$STASH_RID"; fi
+          test -n "$RID" || { echo "退避 ID が取れません"; exit 1; }
+          case "$RID" in *-*) ;; *) RID="$RID-1" ;; esac   # 実行 ID だけなら 1 回目の試行
+          echo "prepare run: $RID"
+          node scripts/update/stash_state.cjs pull "$RID"
+      - name: 入力のプレフィックスが prepare の成果物と一致するか（違えば書く前に止める）
+        run: |
+          node -e '
+            const m = require(process.env.UPDATE_STATE_DIR + "/manifest.json");
+            const want = { articles_prefix: process.env.ARTICLES_PREFIX, old_articles_prefix: process.env.OLD_ARTICLES_PREFIX, refs_prefix: process.env.REFS_PREFIX };
+            let bad = 0;
+            for (const [k, v] of Object.entries(want)) { if (m[k] !== v) { console.error(`${k}: 入力 ${v} / 成果物 ${m[k]}`); bad++; } else console.log(`${k}: ${v}`); }
+            if (bad) { console.error("入力と prepare の成果物が合わない。書かずに止める"); process.exit(1); }
+          '
+      - name: apply（新プレフィックスへ）
+        env:
+          APPLY_SKIP: ${{ github.event.inputs.mode == 'apply-full' && github.event.inputs.apply_skip || '' }}
+        run: node scripts/update/run.cjs apply ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-rebuild-applied
+          path: |
+            ${{ env.UPDATE_STATE_DIR }}/*.json
+            ${{ env.UPDATE_STATE_DIR }}/report.md
+          retention-days: 90
+
+  # ---------------------------------------------------------------- refs（参照関係）だけ全件作り直す（main からだけ）
+  refs:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'refs' && github.ref == 'refs/heads/main' }}
+    outputs:
+      health_code: ${{ steps.health.outputs.code }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      R2_TRANSPORT: s3
+      NODE_OPTIONS: --max-old-space-size=8192   # 09 が refs チャンク（数百 MB）を全部メモリに載せる
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 反映は main のコードでしか流さない
+          lfs: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: 依存（lawtext）
+        run: mkdir -p .tools && cd .tools && printf '{"name":"tools","private":true}\n' > package.json && npm install --no-audit --no-fund lawtext@0.2.1
+      - name: R2 の通り道の確認（S3 API・書かない）
+        run: node scripts/update/lib/r2.cjs --selftest
+      - name: refs を作り直す（02 全件 → 03 XML → 09 抽出 → 09 反映。条文・ベクトル・台帳は触らない）
+        id: refsrun
+        run: node scripts/update/run.cjs refs
+      - name: 本番チェック（refs の作り直しの後。docs/health_check.md）
+        id: health
+        if: ${{ steps.refsrun.outcome == 'success' }}
+        run: |
+          mkdir -p /tmp/health
+          set +e
+          node scripts/health/check_prod.cjs --out /tmp/health/health.md --json /tmp/health/health.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4   # 知らせは health_notify.yml（全呼び出し元で 1 本ずつ）
+        if: ${{ always() && steps.health.outcome == 'success' }}
+        with:
+          name: health-report
+          path: /tmp/health/
+          overwrite: true
+          retention-days: 30
+      - name: XML を消して artifact を小さくする
+        if: always()
+        run: rm -rf "$UPDATE_STATE_DIR/xml"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: refs-rebuild
+          path: |
+            ${{ env.UPDATE_STATE_DIR }}/*.json
+            ${{ env.UPDATE_STATE_DIR }}/refs
+          retention-days: 90
+
+  # ---------------------------------------------------------------- 埋め込みのずれ検査だけ（何も書かない）
+  embedcheck:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'embedcheck' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: 検査
+        env:
+          EMBED_CHECK_LAW: ${{ github.event.inputs.law || '325AC1000000197' }}
+        run: |
+          mkdir -p "$UPDATE_STATE_DIR"
+          node scripts/update/check_embed_drift.cjs --n 20 | tee /tmp/drift.txt
+          { echo '## 埋め込みのずれ検査'; echo; echo '```'; cat /tmp/drift.txt; echo '```'; echo; echo '```json'; cat "$UPDATE_STATE_DIR/embed_drift.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # 本番チェックの結果を知らせる（Issue ラベル health-check。docs/health_check.md）
+  health-notify-apply:
+    needs: [apply]
+    if: ${{ always() && needs.apply.outputs.health_code != '' }}
+    uses: ./.github/workflows/health_notify.yml
+    with:
+      code: ${{ needs.apply.outputs.health_code }}
+      context: 法令の週次の反映後
+    permissions:
+      contents: read
+      issues: write
+
+  # 本番チェックの結果を知らせる（Issue ラベル health-check。docs/health_check.md）
+  health-notify-refs:
+    needs: [refs]
+    if: ${{ always() && needs.refs.outputs.health_code != '' }}
+    uses: ./.github/workflows/health_notify.yml
+    with:
+      code: ${{ needs.refs.outputs.health_code }}
+      context: refs の作り直しの後
+    permissions:
+      contents: read
+      issues: write

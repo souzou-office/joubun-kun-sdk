@@ -1,0 +1,167 @@
+# 公開データの書き出し（docs/open_data.md の 2 章・scripts/open_data/export.cjs → scripts/open_data/release_hf.py）
+#
+#   本番の R2（joubun-kun-data）を読むだけで版ごとの JSONL（gzip）と MANIFEST を作り、Hugging Face のデータセット
+#   （vars HF_DATASET・既定 souzou-office/joubun-kun-law-data）に上げる（2026-11-05 オーナー: 置き場所は Hugging Face・データベースの透明化のため・
+#   更新があったら自動で版を上げる）。¥0・LLM を呼ばない・利用者の入力を使わない。main からだけ流す。
+#   毎週月曜 04:43 JST（日曜の法令・委任先などの週次の後）と手動（Run workflow）。
+#   前の版とファイルの sha256 が全部同じなら版を増やさない。変わっていれば 1 コミットで上げて版の名前のタグを付ける（前の版は履歴に残る）。
+#   前の版より件数が 5% 超減ったら上げる前に止める（版の切り替えなどで正しく減ったときは force_shrink で流す）。
+#   法令か委任先の週次が反映の途中（update_state/*_apply_inprogress.json）なら書き出さずに止める。失敗したら Issue（ラベル open-data）。
+#   ふだんの週は前の版（Hugging Face）の laws・articles を取り、台帳の改正 ID が同じ法令は R2 を読まずに前の版の行を使い回す（export.cjs --prev）。
+#   毎月第 1 月曜と、Run workflow で full を選んだ回は全部読み直す。版の名前は今日の日付で、今日の版がもうあれば .2・.3 … にする（release_hf.py --next-release）。
+#   作ったファイルは成果物として 5 日残す。上げる段だけで止まったら、Run workflow の from_run にその回の番号を入れれば作り直さずに上げられる。
+#
+#   必要な secrets: CLOUDFLARE_ACCOUNT_ID、CF_DATA_API_TOKEN（週次と同じ。本番の R2 を読む）、
+#     HF_TOKEN（そのデータセットに書ける Hugging Face のトークン。fine-grained でそのリポジトリだけに絞る）
+#   必要な variables: HF_DATASET（任意。既定 souzou-office/joubun-kun-law-data）
+#     OPEN_DATA_AUTO_UPLOAD（"1" のときだけ決まった時刻の回が上げる。無ければ前の版と比べるだけ）
+#   データセットは無ければ非公開で作る。**公開の日に Hugging Face の設定で公開にする**（docs/open_data.md「公開の段取り」）
+name: Open data export
+
+on:
+  schedule:
+    - cron: '43 19 * * 0'   # 月曜 04:43 JST
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '版の名前（YYYY-MM-DD。空なら今日）'
+        required: false
+        default: ''
+      upload:
+        description: 'Hugging Face に上げる（false なら手元に作って前の版と比べるだけ）'
+        type: boolean
+        default: false
+      force_shrink:
+        description: '前の版より 5% 超減っても止めない'
+        type: boolean
+        default: false
+      write_check:
+        description: '書き出さずに、Hugging Face のデータセットに書けるか（鍵の権限）だけ確かめる（枝を作ってすぐ消す）'
+        type: boolean
+        default: false
+      full:
+        description: '前の版を使い回さずに全部読み直す（決まった時刻の回は毎月第 1 月曜に全部読み直す）'
+        type: boolean
+        default: false
+      from_run:
+        description: '書き出さずに、前の回（この run の番号）が残したファイルを上げる（上げる段だけで止まったとき。5 日まで）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+concurrency:
+  group: open-data-export
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DATA_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_DATASET: ${{ vars.HF_DATASET || 'souzou-office/joubun-kun-law-data' }}
+      R2_TRANSPORT: ${{ vars.R2_TRANSPORT || 'auto' }}
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Hugging Face の道具（版を固定）
+        run: pip install --quiet huggingface_hub==2.3.0
+      - name: 書き出しと上げ方の確かめ（¥0・固定データ・作り物の Hugging Face）
+        run: |
+          node scripts/open_data/check_export.cjs
+          python3 -I scripts/open_data/check_release_hf.py
+      - name: Hugging Face に書けるかだけ確かめる（write_check のとき・書き出さない）
+        if: ${{ inputs.write_check == true }}
+        run: python3 -I scripts/open_data/release_hf.py --write-check
+      - name: 版の名前を決める（今日の版がもうあれば .2・.3 …）・全部読み直すか決める
+        id: plan
+        if: ${{ inputs.write_check != true && inputs.from_run == '' }}
+        env:
+          RELEASE: ${{ inputs.release }}
+          FULL_INPUT: ${{ inputs.full }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          TODAY=$(TZ=Asia/Tokyo date +%F)
+          if [ -n "$RELEASE" ]; then NAME="$RELEASE"
+          elif [ -n "$HF_TOKEN" ]; then NAME=$(python3 -I scripts/open_data/release_hf.py --next-release "$TODAY" | tail -1) || NAME="$TODAY"
+          else NAME="$TODAY"; fi
+          FULL=false
+          if [ "$FULL_INPUT" = "true" ]; then FULL=true; fi
+          if [ "$EVENT" = "schedule" ] && [ "$(TZ=Asia/Tokyo date +%d)" -le 7 ]; then FULL=true; fi   # 毎月第 1 月曜は全部読み直す
+          echo "release=$NAME" >> "$GITHUB_OUTPUT"
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+          echo "版 $NAME・全部読み直す $FULL"
+      - name: 前の版を取る（変わっていない法令の行を使い回すため・全部読み直す回は取らない）
+        if: ${{ inputs.write_check != true && inputs.from_run == '' && steps.plan.outputs.full != 'true' }}
+        run: |
+          if [ -n "$HF_TOKEN" ]; then python3 -I scripts/open_data/release_hf.py --fetch-prev /tmp/prev || echo "前の版を取れなかった（全部読む）"; fi
+      - name: 書き出す（手元に作る）
+        if: ${{ inputs.write_check != true && inputs.from_run == '' }}
+        env:
+          RELEASE: ${{ steps.plan.outputs.release }}
+          FULL: ${{ steps.plan.outputs.full }}
+        run: |
+          ARGS="--out /tmp/open_data"
+          if [ -n "$RELEASE" ]; then ARGS="$ARGS --release $RELEASE"; fi
+          if [ "$FULL" = "true" ]; then ARGS="$ARGS --full"; elif [ -f /tmp/prev/MANIFEST.json ]; then ARGS="$ARGS --prev /tmp/prev"; fi
+          node scripts/open_data/export.cjs $ARGS
+          M=$(ls -d /tmp/open_data/releases/*/ | tail -1)MANIFEST.json
+          {
+            echo "## 公開データの書き出し"
+            echo '```json'
+            node -e "const m=require(process.argv[1]);const o={};for(const[k,v]of Object.entries(m.files))o[k]={records:v.records,bytes:v.bytes};console.log(JSON.stringify({release:m.release,as_of:m.sources.laws.fetched_at,files:o,notes:m.notes},null,2))" "$M"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 作ったファイルを残す（上げる段で止まっても、from_run で作り直さずに上げられるように・5 日）
+        if: ${{ always() && inputs.write_check != true && inputs.from_run == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-data-${{ github.run_id }}
+          path: /tmp/open_data/releases
+          retention-days: 5
+          if-no-files-found: ignore
+      - name: 前の回が残したファイルを取る（from_run のとき）
+        if: ${{ inputs.write_check != true && inputs.from_run != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: open-data-${{ inputs.from_run }}
+          run-id: ${{ inputs.from_run }}
+          github-token: ${{ github.token }}
+          path: /tmp/open_data/releases
+      - name: Hugging Face に上げる（変わっていなければ何もしない・上げない回は比べるだけ）
+        if: ${{ inputs.write_check != true }}
+        env:
+          UPLOAD: ${{ (github.event_name == 'schedule' && vars.OPEN_DATA_AUTO_UPLOAD == '1') || inputs.upload == true }}
+          FORCE_SHRINK: ${{ inputs.force_shrink }}
+        run: |
+          ARGS="--out /tmp/open_data"
+          if [ "$FORCE_SHRINK" = "true" ]; then ARGS="$ARGS --force-shrink"; fi
+          if [ "$UPLOAD" != "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "$UPLOAD" = "true" ] || [ -n "$HF_TOKEN" ]; then python3 -I scripts/open_data/release_hf.py $ARGS; else echo "HF_TOKEN が無いので比べない"; fi
+      - name: 失敗したら Issue で知らせる（ラベル open-data）
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create open-data --color 0E8A16 --description '公開データの書き出し' 2>/dev/null || true
+          N=$(gh issue list --label open-data --state open --json number --jq '.[0].number')
+          if [ -n "$N" ]; then gh issue comment "$N" --body "また失敗しました: $RUN_URL"; else gh issue create --label open-data --title '公開データの書き出しが止まりました' --body "毎週の書き出し（Hugging Face への版の更新）が止まりました。ログ: $RUN_URL
+
+          件数が前の版より 5% 超減った・週次の反映の途中・鍵が無い などが考えられます。ログの [hf] と [open-data] の行を見てください。"; fi

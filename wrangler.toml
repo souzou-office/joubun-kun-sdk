@@ -1,0 +1,8 @@
+# これは Worker の設定ではありません。データを作るコード（scripts/）が「今の版のプレフィックス」を読むためだけのファイルです。
+# 条文くんの本番の wrangler.toml の [vars] のうち、データの置き場の名前だけを写しています（公開データの版とは別の、条文くんの本番の R2 での名前）。
+# 自分の R2 で動かすときは、自分の置き場の名前に書き換えてください。
+[vars]
+ARTICLES_PREFIX = "large_law_articles_v4"
+REFS_PREFIX = "refs_chunks_v5"
+TSUTATSU_CHUNKS_PREFIX = "tsutatsu_chunks_v4"
+DELEGATIONS_PREFIX = "delegations_v6"

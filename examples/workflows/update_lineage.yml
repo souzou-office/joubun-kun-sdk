@@ -1,0 +1,117 @@
+# 条の系譜（判例の紐付けの付け直し）の月に 1 回の作り直し（docs/lineage.md。コードは scripts/lineage/）
+#
+#   毎月 2 日 09:13 JST に:
+#     1. R2 lineage_v1/（系譜・Jev の判定の控え・旧法の受け皿・付け直しの表）を取る（relink_hanrei.cjs pull）
+#     2. 今の法令の系譜に、e-Gov の新しい版（前回の続き）を足す（monthly.py。名古屋大学のデータは使わない）
+#     3. 新しく出た「条を丸ごと書き換えた所」を Jev で判定する（judge_rewrites.py。本番の Worker の /api/jev-score・1 回 MAX_ITEMS 組まで。
+#        本番と共用の 1 日の上限 JEV_DAILY_USD に当たれば判定の残りは翌月に回る）
+#     4. 付け直しの表を作り直し（tables.py）、判例の全件を R2 から読んで付け直す（relink_hanrei.cjs build --cases-r2）
+#     4b. 書き換えの出来事が新しく付いた今の条に載っていた判例を待ち行列（R2 update_state/lineage_judge_queue.json）に入れ、Opus 5.5 で
+#        「判断・論理が今の条にも通用するか」を問い方を変えて 2 回聞き、両方が載せるとした条だけ載せる（judge_cases.cjs。1 回 $5・月 $20 まで・
+#        溢れた分は翌月。判断したものがあれば付け直しをもう一度流す）
+#     5. 中身が変わったファイルだけ、退避してから R2 の hanrei_v2/ と lineage_v1/ に書く（relink_hanrei.cjs upload --changed-only）。
+#        付け直した引用の数が 5% を超えて変わった・判例の件数が R2 と違う・判例の週次が動いている、のどれかなら書かずに止める
+#   止まったか失敗したら Issue（ラベル lineage-update）。R2 に lineage_v1/tables/index.json が無い（全件の作り直しをまだ書いていない）月は何もしない。
+#   戻すときは R2 update_state/hanrei_v2_backup/<run>/ を元のキーに書き戻す（_manifest.json の added は消す）。
+#   必要な secrets: CLOUDFLARE_ACCOUNT_ID、CF_DATA_API_TOKEN（R2 編集）、QA_BYPASS_KEY（本番の Worker の Jev を呼ぶ）
+name: Update lineage (monthly)
+
+on:
+  schedule:
+    - cron: '13 0 2 * *'   # 毎月 2 日 09:13 JST（判例の週次の日曜とずらす）
+  workflow_dispatch:
+    inputs:
+      approved:
+        description: '急な変化・件数の違いで止めた回を、中身を確かめたうえで書く（--approved）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: update-hanrei-write   # 判例の週次の書き込み（apply・restore）と同時に書かない
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DATA_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+  R2_TRANSPORT: ${{ vars.R2_TRANSPORT || 'auto' }}
+  LINEAGE_DATA: ${{ github.workspace }}/lineage_data
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  monthly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 書くのは main のコードだけ
+      - name: package.json だけ LFS から取る
+        run: git lfs pull --include="package.json"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: ¥0 の確認
+        run: |
+          python -I -X utf8 scripts/lineage/check_lineage.py
+          node scripts/lineage/check_currefs.cjs
+          node scripts/lineage/check_no_v1_links.cjs
+      - name: R2 の lineage_v1 を取る（無ければ何もしない）
+        id: pull
+        run: |
+          if node scripts/lineage/relink_hanrei.cjs pull; then echo "ok=1" >> "$GITHUB_OUTPUT"; else echo "ok=0" >> "$GITHUB_OUTPUT"; fi
+      - name: 系譜に e-Gov の新しい版を足す
+        if: steps.pull.outputs.ok == '1'
+        run: python -I -X utf8 scripts/lineage/monthly.py
+      - name: 書き換えを Jev で判定する
+        if: steps.pull.outputs.ok == '1'
+        env:
+          JEV_URL: ${{ vars.JEV_WORKER_URL || 'https://{あなたの Worker}.workers.dev' }}
+          JEV_KEY: ${{ secrets.QA_BYPASS_KEY }}
+          MAX_ITEMS: '2000'
+        run: |
+          ids=$(python -I -X utf8 -c "import json,os; print(' '.join(r['law_id'] for r in json.load(open(os.path.join(os.environ['LINEAGE_DATA'],'out','monthly.json'))) if r.get('new_reviews')))")
+          if [ -n "$ids" ]; then python -I -X utf8 scripts/lineage/judge_rewrites.py $ids; else echo "判定する書き換えは無い"; fi
+      - name: 付け直しの表と全件の付け直し
+        if: steps.pull.outputs.ok == '1'
+        run: |
+          python -I -X utf8 scripts/lineage/tables.py
+          node scripts/lineage/relink_hanrei.cjs build --cases-r2 --fulltext-r2
+      - name: 書き換えられた条の判例を判断し直す（待ち行列 → Opus 5.5 で 2 回・両方が載せるとした条だけ）
+        id: judge
+        if: steps.pull.outputs.ok == '1'
+        env:
+          JUDGE_URL: ${{ vars.JEV_WORKER_URL || 'https://{あなたの Worker}.workers.dev' }}
+          JUDGE_KEY: ${{ secrets.QA_BYPASS_KEY }}
+          JUDGE_RUN_USD: ${{ vars.JUDGE_RUN_USD || '5' }}
+          JUDGE_MONTH_USD: ${{ vars.JUDGE_MONTH_USD || '20' }}
+        run: |
+          node scripts/lineage/check_judge.cjs
+          node scripts/lineage/judge_cases.cjs enqueue
+          node scripts/lineage/judge_cases.cjs run
+      - name: 判断し直した分を入れて付け直し直す
+        if: steps.pull.outputs.ok == '1' && steps.judge.outputs.judged != '' && steps.judge.outputs.judged != '0'
+        run: node scripts/lineage/relink_hanrei.cjs build --cases-r2 --fulltext-r2
+      - name: 変わったものだけ書く
+        if: steps.pull.outputs.ok == '1'
+        run: |
+          LIVE=""
+          if grep -q '^HANREI_LINKS_PREFIX = "hanrei_v2/links"' wrangler.toml; then LIVE="--live"; fi
+          APPROVED=""
+          if [ "${{ github.event.inputs.approved }}" = "true" ]; then APPROVED="--approved"; fi
+          node scripts/lineage/relink_hanrei.cjs upload --changed-only $LIVE $APPROVED
+      - name: 止まった・失敗したら Issue
+        if: failure()
+        run: |
+          gh label create lineage-update --color BFD4F2 --description '条の系譜の月次の作り直し' --force || true
+          gh issue create --label lineage-update --title "条の系譜の月次の作り直しが止まった（run ${{ github.run_id }}）" \
+            --body "Actions の Update lineage (monthly) が止まりました: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ログの最後の行が理由です（急な変化・件数の違い・判例の週次の作業中の印・e-Gov の取得の失敗など）。R2 には書いていないか、退避してから書いた途中です（update_state/hanrei_v2_backup/）。
+          中身を確かめて問題なければ Run workflow を approved で流します。docs/lineage.md の「月に 1 回の作り直し」"

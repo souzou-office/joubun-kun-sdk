@@ -73,10 +73,15 @@ const SUBJ = `([^。（]{0,30}?)(?:とは、|は、)`;
 // 任意マッチの読み飛ばしを先頭に置く。全て optional なので既存の一致は変わらず、confirmed が増える方向のみ。
 // 「第三百九十六条第一項後段の規定により」の「後段」「前段」「本文」「ただし書」も読み飛ばす（2026-09-22。会社法施行規則 110 条で実測）
 const SKIP = `(?:第${KNUM}項)?(?:第${KNUM}号(?:の${KNUM})*)?(?:前段|後段|本文|ただし書)?(?:（[^）]{0,50}）)?`;
+// 併記の受け皿「法第二条第三項第三号の内閣府令・防災庁令で定める事業は、」（共同命令）も 1 つの種別として読む（2026-11-23。
+// 防災庁の発足で「内閣府令」が「内閣府令・防災庁令」に置き換わり、東日本大震災復興特別区域法の確定が 35→23 に減った）。
+// 種別の判定（kindBucket・省の照合）は先頭の種別で行う（親の側の findDelegations も併記の先頭を kind にする）
+const KIND_SEQ = `${KIND_CORE}(?:・${KIND_CORE})*`;
+const firstKind = (tok) => (tok ? String(tok).split('・')[0] : null);
 const STRONG_PATTERNS = [
-  { name: 'に規定するKINDで定める…は', re: new RegExp(`^${SKIP}に規定する(?:[^。]{0,40}?)?(${KIND_CORE})(?:で(?:別段の)?定める|の定める)${SUBJ}`) },
-  { name: 'の規定によりKINDで定める…は', re: new RegExp(`^${SKIP}の規定(?:により|に基づき|による)(?:[^。]{0,40}?)?(${KIND_CORE})(?:で定める|の定める)${SUBJ}`) },
-  { name: 'のKINDで定める…は', re: new RegExp(`^${SKIP}の(${KIND_CORE})で定める${SUBJ}`) },
+  { name: 'に規定するKINDで定める…は', re: new RegExp(`^${SKIP}に規定する(?:[^。]{0,40}?)?(${KIND_SEQ})(?:で(?:別段の)?定める|の定める)${SUBJ}`) },
+  { name: 'の規定によりKINDで定める…は', re: new RegExp(`^${SKIP}の規定(?:により|に基づき|による)(?:[^。]{0,40}?)?(${KIND_SEQ})(?:で定める|の定める)${SUBJ}`) },
+  { name: 'のKINDで定める…は', re: new RegExp(`^${SKIP}の(${KIND_SEQ})で定める${SUBJ}`) },
   { name: 'の委任に基づき', re: new RegExp(`^${SKIP}の(?:規定による)?委任に基づ[きく]`) },
   { name: 'に規定する…で定める…は(種別語なし)', re: new RegExp(`^${SKIP}に規定する[^。]{0,40}?で定める${SUBJ}`) },
   // 技術的読替えの受け皿（2026-09-22。全法令の weak の分布で 200 件超）: 「法第N条第N項の規定による技術的読替えは、次の表のとおりとする。」
@@ -96,7 +101,7 @@ const STRONG_PATTERNS = [
 // 柱書の目的語（「事項」等）は総称なので、親の後続語との名詞照合は掛けない（号が規定を特定しているので位置で決まる）。
 const ENUM_ITEM_TAIL_RE = /^(?:の規定)?[。]?$/;   // 引用の後ろに残ってよいもの
 const ENUM_LEAD_PATTERNS = [
-  { name: '列挙型: 次に掲げる規定に規定するKINDで定める…は', re: new RegExp(`^(?:次|次の各号|以下)に掲げる(?:法の)?規定(?:に規定する|の規定による|の規定により|の)(?:[^。]{0,40}?)?(${KIND_CORE})(?:で(?:別段の)?定める(?:べき)?|の定める)${SUBJ}`) },
+  { name: '列挙型: 次に掲げる規定に規定するKINDで定める…は', re: new RegExp(`^(?:次|次の各号|以下)に掲げる(?:法の)?規定(?:に規定する|の規定による|の規定により|の)(?:[^。]{0,40}?)?(${KIND_SEQ})(?:で(?:別段の)?定める(?:べき)?|の定める)${SUBJ}`) },
   { name: '列挙型: 次に掲げる規定の委任に基づき', re: new RegExp(`^(?:次|次の各号|以下)に掲げる(?:法の)?規定の(?:規定による)?委任に基づ[きく]`) },
   // 手続型（2026-09-22）: 「次に掲げる規定に規定する事項を電磁的方法により提供しようとする者は、法務省令で定めるところにより、あらかじめ、…承諾を得なければならない。」
   // （会社法施行令 1 条。号は「法第五十九条第四項」）。政令が列挙した規定の手続そのものを書く型で、親側は「政令で定めるところにより」。
@@ -264,7 +269,7 @@ function linkParent(parentId, opts = {}) {
       let strength = 'weak', patName = null, recKindTok = null, enumLead = null, tokoroOnly = false;
       for (const p of STRONG_PATTERNS) {
         const m = w.match(p.re);
-        if (m) { strength = 'strong'; patName = p.name; recKindTok = m[1] || null; break; }
+        if (m) { strength = 'strong'; patName = p.name; recKindTok = firstKind(m[1]); break; }
       }
       // 列挙型: 号が引用だけなら柱書で判定する
       if (strength === 'weak' && sent.item != null && citeStart0(sent, ref) && ENUM_ITEM_TAIL_RE.test(w)) {
@@ -272,7 +277,7 @@ function linkParent(parentId, opts = {}) {
         const lw = lead ? stripParens(lead.text) : '';
         for (const p of ENUM_LEAD_PATTERNS) {
           const m = lw.match(p.re);
-          if (m) { strength = 'strong'; patName = p.name; recKindTok = m[1] || null; enumLead = lead; tokoroOnly = !!p.tokoro; stats.enum_lead++; break; }
+          if (m) { strength = 'strong'; patName = p.name; recKindTok = firstKind(m[1]); enumLead = lead; tokoroOnly = !!p.tokoro; stats.enum_lead++; break; }
         }
       }
 

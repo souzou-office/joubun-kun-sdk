@@ -76,6 +76,10 @@ const parentLaw = {
     art('60', '第六十条', '（報告）', [
       para('1', [sent('検査業者は、内閣府令で定める事項を報告しなければならない。')]),
     ]),
+    // 併記の委任（共同命令）「内閣府令・防災庁令で定める」（2026-11-23。東日本大震災復興特別区域法で実測）
+    art('61', '第六十一条', '（報告の事項）', [
+      para('1', [sent('検査業者は、内閣府令・防災庁令で定める事項を報告しなければならない。')]),
+    ]),
     art('301', '第三百一条', '（株主総会参考書類及び議決権行使書面の交付等）', [
       para('1', [sent('取締役は、株主総会の招集の通知に際して、法務省令で定めるところにより、株主に対し、株主総会参考書類及び議決権行使書面を交付しなければならない。')]),
     ]),
@@ -219,6 +223,9 @@ const child2Law = {
     art('5', '第五条', '（報告事項）', [
       para('1', [sent('検査業法第六十条第一項に規定する内閣府令で定める事項は、次に掲げる事項とする。')]),
     ]),
+    art('6', '第六条', '（報告の事項）', [
+      para('1', [sent('検査業法第六十一条第一項の内閣府令・防災庁令で定める事項は、次に掲げる事項とする。')]),
+    ]),
   ],
 };
 // 親と無関係な題名の内閣府令。文型が合っていても専属でないので weak のまま
@@ -253,6 +260,7 @@ const reverseIndex = [
   { src: CHILD4, key: `${CHILD4}_Art20`, i: 0, ref: { type: 'varref', abbreviation: '法', text: '法', start: 0, end: 1, target_law_id: PARENT, paragraph: '1', item: null } },   // 施行令 20 条 → 55 条 1 項（技術的読替え）
   external(CHILD2, '5', '1', '検査業法第六十条第一項', { article: '60', paragraph: '1' }),   // 芯が一致する内閣府令 → 専属扱い
   external(CHILD3, '4', '1', '検査業法第六十条第一項', { article: '60', paragraph: '1' }),   // 無関係な内閣府令 → weak
+  external(CHILD2, '6', '1', '検査業法第六十一条第一項', { article: '61', paragraph: '1' }),   // 併記の受け皿「の内閣府令・防災庁令で定める事項は」
   varref('65', '1', null, 0),                 // 65 条 → 301 条 1 項 又は 302 条 1 項（併記）
   varref('110', '1', null, 0),                // 110 条 → 396 条 1 項後段
   varref('116', '1', '1', 0),                 // 116 条 一 → 435 条 2 項
@@ -283,8 +291,10 @@ const linked = linkParent(PARENT, { raw, noWrite: true, quiet: true });
 const find = (article, paragraph, itemNum) => linked.delegations.find((d) => d.parent_article === article && String(d.parent_paragraph) === String(paragraph) && (itemNum == null ? d.parent_item == null : String(d.parent_item) === String(itemNum)));
 const cands = (d) => (d ? d.candidates.map((c) => `${c.law_id}/${c.article}${c.item ? '#' + c.item : ''}:${c.strength}`) : []);
 
-check('委任表現の抽出（28 か所）', raw.delegations.filter((d) => d.provision === 'main').length === 28, JSON.stringify(raw.delegations.map((d) => [d.article, d.paragraph, d.item, d.expr])));
+check('委任表現の抽出（29 か所）', raw.delegations.filter((d) => d.provision === 'main').length === 29, JSON.stringify(raw.delegations.map((d) => [d.article, d.paragraph, d.item, d.expr])));
 
+const d61 = find('61', '1', null);
+check('併記の受け皿: 「内閣府令・防災庁令で定める」→ 内閣府令 6 条「…の内閣府令・防災庁令で定める事項は」が confirmed', d61 && d61.status === 'confirmed' && cands(d61).join() === `${CHILD2}/6:strong`, d61 && `${d61.status} ${cands(d61)}`);
 const d301 = find('301', '1', null), d302 = find('302', '1', null);
 check('併記: 301 条 1 項 と 302 条 1 項 の両方 → 施行規則 65 条 が confirmed', d301 && d302 && d301.status === 'confirmed' && d302.status === 'confirmed' && cands(d301).join() === `${CHILD}/65:strong` && cands(d302).join() === `${CHILD}/65:strong`, `${d301 && d301.status} ${cands(d301)} / ${d302 && d302.status} ${cands(d302)}`);
 const d396 = find('396', '1', null);
@@ -335,7 +345,7 @@ check('告示への委任（「厚生労働大臣が定める基準」）は kok
 check('包括委任「必要な事項は、政令で定める」は 検査業法施行令 への法令単位リンク（law_level）', d900 && d900.status === 'law_level' && d900.law_level && d900.law_level.law_id === CHILD4 && d900.law_level.law_title === '検査業法施行令' && d900.candidates.length === 0, d900 && `${d900.status} ${JSON.stringify(d900.law_level)}`);
 check('種別が合わない専属の子（内閣府令 → 「検査業法施行規則」は法務省令）には落とさず none のまま', d900_2 && d900_2.status === 'none' && !d900_2.law_level, d900_2 && `${d900_2.status}`);
 check('confirmed / multiple は法令単位に落とさない', linked.delegations.filter((d) => d.law_level).every((d) => d.status === 'law_level') && linked.delegations.filter((d) => d.status === 'confirmed').every((d) => !d.law_level));
-check('統計: 列挙型 7（116 条 ×3・225 条・準用で落とす 200 条・手続型の施行令 1 条 ×2）・strong 17・準用先 3・未特定 0', linked.stats.enum_lead === 7 && linked.stats.strong === 17 && linked.stats.via_junyo === 3 && linked.stats.unlocatable === 0, JSON.stringify(linked.stats));
+check('統計: 列挙型 7（116 条 ×3・225 条・準用で落とす 200 条・手続型の施行令 1 条 ×2）・strong 18（併記の受け皿 61 条を含む）・準用先 3・未特定 0', linked.stats.enum_lead === 7 && linked.stats.strong === 18 && linked.stats.via_junyo === 3 && linked.stats.unlocatable === 0, JSON.stringify(linked.stats));
 // 親の後続語が「ところにより」でも、受け皿の目的語が「事項」でも weak に落とさない（GENERIC_NOUN）
 check('「法務省令で定めるところにより」の委任が名詞照合で落ちない', d396 && d396.candidates[0].strength === 'strong' && /ところにより/.test(d396.trailing), d396 && `${d396.trailing} ${cands(d396)}`);
 check('列挙型の候補は柱書の目的語を持つが、名詞不一致で weak に落ちない', d440 && d440.candidates[0].noun === 'べき事項' && d440.candidates[0].strength === 'strong' && d440.candidates[0].matched_pattern.startsWith('列挙型'), d440 && JSON.stringify([d440.candidates[0].noun, d440.candidates[0].strength, d440.candidates[0].matched_pattern]));
